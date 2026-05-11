@@ -1,0 +1,6 @@
+step,flow_rate_m3h,duration_min,end_drawdown_m,well_id,test_date,swl_m,thickness_m,radius_m
+1,5.0,60,2.15,BH-01,2024-03-15,12.5,50.0,0.15
+2,10.0,60,5.40,,,,,
+3,15.0,60,10.25,,,,,
+4,20.0,60,17.60,,,,,
+5,25.0,60,27.35,,,,,

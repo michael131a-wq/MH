@@ -17,7 +17,7 @@ CSV format (header optional, "#" lines ignored):
                                    ...
 
 Options:
-  --Q       Pumping rate (m³/s)              [required]
+  --Q       Pumping rate (L/s)               [required]
   --r       Obs-well distance from pump (m)  [required]
   --T_init  Initial T guess (m²/day)         [default: 86.4]
   --S_init  Initial S guess (-)              [default: 1e-4]
@@ -31,7 +31,7 @@ Options:
 Unit conventions:
   Time  — CSV column 1 in MINUTES  (converted to seconds internally)
   T     — input/output in M²/DAY   (converted to m²/s internally)
-  Q     — m³/s
+  Q     — L/s  (converted to m³/s internally)
   r, B, s — metres
 
 Physical interpretation of B:
@@ -50,6 +50,7 @@ warnings.filterwarnings("ignore")
 # Unit conversion constants
 _MIN_TO_S  = 60.0       # minutes  → seconds
 _DAY_TO_S  = 86400.0    # days     → seconds  (1 m²/day = 1/86400 m²/s)
+_LS_TO_M3S = 1e-3       # L/s      → m³/s
 
 try:
     import matplotlib.pyplot as plt
@@ -224,14 +225,15 @@ def run_analysis(t: np.ndarray, s_obs: np.ndarray,
     Returns a dict with keys:
       T, S, B, leakance, s_model, stats, deriv_stats, deriv_obs, deriv_model.
     """
-    # t is in seconds internally; T_init arrives in m²/day → convert to m²/s
+    # Convert user-facing units → SI for all internal calculations
+    Q_si      = Q * _LS_TO_M3S   # L/s → m³/s
     T_init_si = T_init / _DAY_TO_S
 
     print("=" * 62)
     print("  HANTUSH-JACOB SOLUTION — Constant Rate Test Analysis")
     print("  (Leaky Confined Aquifer, no aquitard storage)")
     print("=" * 62)
-    print(f"  Pumping rate   Q = {Q:.4e} m³/s")
+    print(f"  Pumping rate   Q = {Q:.4f} L/s  ({Q_si:.4e} m³/s)")
     print(f"  Observation    r = {r:.2f} m")
     print(f"  Data points      = {len(t)}")
     print(f"  Time range       = {t[0]/_MIN_TO_S:.2f} – {t[-1]/_MIN_TO_S:.2f} min")
@@ -240,7 +242,7 @@ def run_analysis(t: np.ndarray, s_obs: np.ndarray,
 
     # ── Curve fit (all SI: m²/s, seconds) ────────────────────────────────────
     def _model(t_arr, T, S, B):
-        return hantush_drawdown(t_arr, T, S, B, Q, r)
+        return hantush_drawdown(t_arr, T, S, B, Q_si, r)
 
     T_fit = T_init_si
     S_fit = S_init
@@ -400,16 +402,17 @@ def plot_results(t: np.ndarray, s_obs: np.ndarray, result: dict,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_test_data(T_day: float = 86.4, S: float = 1e-4,
-                       B: float = 500.0, Q: float = 1e-3,
+                       B: float = 500.0, Q_ls: float = 1.0,
                        r: float = 50.0,
                        t_start_min: float = 1, t_end_min: float = 1440,
                        n_pts: int = 40, noise_std: float = 0.005,
                        seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
-    """Return (t_seconds, s_noisy) for a synthetic Hantush-Jacob CRT.  T_day in m²/day."""
+    """Return (t_seconds, s_noisy) for a synthetic Hantush-Jacob CRT.  T_day in m²/day, Q_ls in L/s."""
     t_s = np.logspace(np.log10(t_start_min * _MIN_TO_S),
                       np.log10(t_end_min   * _MIN_TO_S), n_pts)
     T_si = T_day / _DAY_TO_S
-    s = hantush_drawdown(t_s, T_si, S, B, Q, r)
+    Q_si = Q_ls * _LS_TO_M3S
+    s = hantush_drawdown(t_s, T_si, S, B, Q_si, r)
     rng = np.random.default_rng(seed)
     s_noisy = np.maximum(s + rng.normal(0, noise_std, size=n_pts), 0.0)
     return t_s, s_noisy
@@ -426,7 +429,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--data",   help="CSV file: time(min), drawdown(m)")
     p.add_argument("--Q",      type=float, required=True,
-                   help="Pumping rate (m³/s)")
+                   help="Pumping rate (L/s)")
     p.add_argument("--r",      type=float, required=True,
                    help="Distance from pumping well to observation well (m)")
     p.add_argument("--T_init", type=float, default=86.4,
@@ -455,7 +458,7 @@ def main(argv=None):
         print("  Generating synthetic Hantush-Jacob CRT data …")
         t, s_obs = generate_test_data(
             T_day=args.T_init, S=args.S_init, B=args.B_init,
-            Q=args.Q, r=args.r,
+            Q_ls=args.Q, r=args.r,
         )
     else:
         path = Path(args.data)

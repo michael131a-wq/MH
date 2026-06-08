@@ -11,21 +11,28 @@ Usage:
   python hantush_crt.py --data crt_data.csv --Q 0.001 --r 50 [options]
 
 CSV format (header optional, "#" lines ignored):
-  time(s), drawdown(m)   e.g.   60, 0.10
-                                  120, 0.18
-                                  ...
+  time(min), drawdown(m)   e.g.   1, 0.10
+                                   2, 0.18
+                                   5, 0.28
+                                   ...
 
 Options:
-  --Q       Pumping rate (m³/s)            [required]
-  --r       Obs-well distance from pump (m)[required]
-  --T_init  Initial T guess (m²/s)         [default: 1e-3]
-  --S_init  Initial S guess (-)            [default: 1e-4]
-  --B_init  Initial leakage factor B (m)   [default: 500]
+  --Q       Pumping rate (L/s)               [required]
+  --r       Obs-well distance from pump (m)  [required]
+  --T_init  Initial T guess (m²/day)         [default: 86.4]
+  --S_init  Initial S guess (-)              [default: 1e-4]
+  --B_init  Initial leakage factor B (m)     [default: 500]
               B = sqrt(T · b' / K')
               b' = aquitard thickness, K' = aquitard hydraulic conductivity
-  --L       Bourdet smoothing factor       [default: 0.8]
+  --L       Bourdet smoothing factor         [default: 0.8]
   --plot    Save diagnostic plot PNG
-  --out     Output PNG filename            [default: hantush_crt_analysis.png]
+  --out     Output PNG filename              [default: hantush_crt_analysis.png]
+
+Unit conventions:
+  Time  — CSV column 1 in MINUTES  (converted to seconds internally)
+  T     — input/output in M²/DAY   (converted to m²/s internally)
+  Q     — L/s  (converted to m³/s internally)
+  r, B, s — metres
 
 Physical interpretation of B:
   Large B  → low leakage  → approaches Theis (confined)
@@ -39,6 +46,11 @@ import numpy as np
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
+
+# Unit conversion constants
+_MIN_TO_S  = 60.0       # minutes  → seconds
+_DAY_TO_S  = 86400.0    # days     → seconds  (1 m²/day = 1/86400 m²/s)
+_LS_TO_M3S = 1e-3       # L/s      → m³/s
 
 try:
     import matplotlib.pyplot as plt
@@ -58,17 +70,17 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_data(path: str) -> tuple[np.ndarray, np.ndarray]:
-    """Load time(s) and drawdown(m) columns from a CSV file."""
+    """Load time(min) and drawdown(m) from CSV; returns time in seconds."""
     data = np.genfromtxt(path, delimiter=",", comments="#", dtype=float)
     if data.ndim == 1:
         raise ValueError("CSV must have at least two columns (time, drawdown).")
     mask = np.isfinite(data[:, 0]) & np.isfinite(data[:, 1]) & (data[:, 0] > 0)
     if mask.sum() < 3:
         raise ValueError("Need at least 3 valid (time > 0, finite drawdown) rows.")
-    t = data[mask, 0]
-    s = data[mask, 1]
-    order = np.argsort(t)
-    return t[order], s[order]
+    t_min = data[mask, 0]
+    s     = data[mask, 1]
+    order = np.argsort(t_min)
+    return t_min[order] * _MIN_TO_S, s[order]   # convert minutes → seconds
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -213,22 +225,26 @@ def run_analysis(t: np.ndarray, s_obs: np.ndarray,
     Returns a dict with keys:
       T, S, B, leakance, s_model, stats, deriv_stats, deriv_obs, deriv_model.
     """
+    # Convert user-facing units → SI for all internal calculations
+    Q_si      = Q * _LS_TO_M3S   # L/s → m³/s
+    T_init_si = T_init / _DAY_TO_S
+
     print("=" * 62)
     print("  HANTUSH-JACOB SOLUTION — Constant Rate Test Analysis")
     print("  (Leaky Confined Aquifer, no aquitard storage)")
     print("=" * 62)
-    print(f"  Pumping rate   Q = {Q:.4e} m³/s")
+    print(f"  Pumping rate   Q = {Q:.4f} L/s  ({Q_si:.4e} m³/s)")
     print(f"  Observation    r = {r:.2f} m")
     print(f"  Data points      = {len(t)}")
-    print(f"  Time range       = {t[0]:.1f} – {t[-1]:.1f} s")
+    print(f"  Time range       = {t[0]/_MIN_TO_S:.2f} – {t[-1]/_MIN_TO_S:.2f} min")
     print(f"  Drawdown range   = {s_obs.min():.4f} – {s_obs.max():.4f} m")
     print("-" * 62)
 
-    # ── Curve fit ────────────────────────────────────────────────────────────
+    # ── Curve fit (all SI: m²/s, seconds) ────────────────────────────────────
     def _model(t_arr, T, S, B):
-        return hantush_drawdown(t_arr, T, S, B, Q, r)
+        return hantush_drawdown(t_arr, T, S, B, Q_si, r)
 
-    T_fit = T_init
+    T_fit = T_init_si
     S_fit = S_init
     B_fit = B_init
     perr  = np.array([np.nan, np.nan, np.nan])
@@ -236,7 +252,7 @@ def run_analysis(t: np.ndarray, s_obs: np.ndarray,
     try:
         popt, pcov = curve_fit(
             _model, t, s_obs,
-            p0=[T_init, S_init, B_init],
+            p0=[T_init_si, S_init, B_init],
             bounds=([1e-10, 1e-12, 1.0], [10.0, 1.0, 1e7]),
             maxfev=50000,
         )
@@ -246,13 +262,14 @@ def run_analysis(t: np.ndarray, s_obs: np.ndarray,
         print(f"  WARNING: curve_fit did not converge — {exc}")
         print("  Falling back to initial guesses.")
 
-    leakance = T_fit / (B_fit ** 2)   # K'/b' in s⁻¹
+    T_fit_day = T_fit * _DAY_TO_S           # m²/s → m²/day for display
+    leakance  = T_fit_day / (B_fit ** 2)    # K'/b' in day⁻¹
 
-    print(f"  Fitted T         = {T_fit:.4e} ± {perr[0]:.2e} m²/s")
+    print(f"  Fitted T         = {T_fit_day:.4f} ± {perr[0]*_DAY_TO_S:.4f} m²/day")
     print(f"  Fitted S         = {S_fit:.4e} ± {perr[1]:.2e}")
-    print(f"  Fitted B         = {B_fit:.4e} ± {perr[2]:.2e} m")
-    print(f"  Leakance K'/b'   = T / B² = {leakance:.4e} s⁻¹")
-    print(f"  Hydraulic diff.  = T / S  = {T_fit/S_fit:.4e} m²/s")
+    print(f"  Fitted B         = {B_fit:.4f} ± {perr[2]:.4f} m")
+    print(f"  Leakance K'/b'   = T / B² = {leakance:.4e} day⁻¹")
+    print(f"  Hydraulic diff.  = T / S  = {T_fit_day/S_fit:.4e} m²/day")
     print(f"  r / B            = {r/B_fit:.4f}  (≪1 → nearly confined)")
 
     # ── Model drawdown ────────────────────────────────────────────────────────
@@ -284,7 +301,7 @@ def run_analysis(t: np.ndarray, s_obs: np.ndarray,
     print("=" * 62)
 
     return {
-        "T": T_fit, "S": S_fit, "B": B_fit,
+        "T_si": T_fit, "T_day": T_fit_day, "S": S_fit, "B": B_fit,
         "leakance": leakance,
         "s_model": s_model,
         "stats": stats, "deriv_stats": dstats,
@@ -303,19 +320,21 @@ def plot_results(t: np.ndarray, s_obs: np.ndarray, result: dict,
         print("  matplotlib not available — skipping plot.")
         return
 
-    T_fit   = result["T"]
-    S_fit   = result["S"]
-    B_fit   = result["B"]
-    s_model = result["s_model"]
-    stats   = result["stats"]
-    d_obs   = result["deriv_obs"]
-    d_model = result["deriv_model"]
+    T_fit_day = result["T_day"]
+    S_fit     = result["S"]
+    B_fit     = result["B"]
+    s_model   = result["s_model"]
+    stats     = result["stats"]
+    d_obs     = result["deriv_obs"]
+    d_model   = result["deriv_model"]
+
+    t_min = t / _MIN_TO_S   # plot x-axis in minutes
 
     fig, axes = plt.subplots(2, 2, figsize=(13, 9))
     fig.suptitle(
         "Hantush-Jacob (1955) CRT Analysis — Leaky Confined Aquifer\n"
-        f"T = {T_fit:.3e} m²/s   S = {S_fit:.3e}   B = {B_fit:.3e} m   "
-        f"K'/b' = {T_fit/B_fit**2:.3e} s⁻¹\n"
+        f"T = {T_fit_day:.4f} m²/day   S = {S_fit:.3e}   B = {B_fit:.4f} m   "
+        f"K'/b' = {T_fit_day/B_fit**2:.3e} day⁻¹\n"
         f"R² = {stats['R²']:.4f}   RMSE = {stats['RMSE (m)']:.4f} m   "
         f"NSE = {stats['NSE']:.4f}",
         fontsize=9, fontweight="bold",
@@ -323,17 +342,17 @@ def plot_results(t: np.ndarray, s_obs: np.ndarray, result: dict,
 
     # ── (1) Log–log: drawdown + Bourdet derivative ────────────────────────────
     ax = axes[0, 0]
-    ax.loglog(t, s_obs,   "o",  color="steelblue",    ms=5, label="Observed Δs",     zorder=4)
-    ax.loglog(t, s_model, "-",  color="firebrick",     lw=2, label="H-J model Δs")
+    ax.loglog(t_min, s_obs,   "o",  color="steelblue",    ms=5, label="Observed Δs",     zorder=4)
+    ax.loglog(t_min, s_model, "-",  color="firebrick",     lw=2, label="H-J model Δs")
     m1 = ~np.isnan(d_obs)   & (d_obs   > 0)
     m2 = ~np.isnan(d_model) & (d_model > 0)
     if m1.any():
-        ax.loglog(t[m1], d_obs[m1],   "s",  color="cornflowerblue",
-                  ms=5, mfc="none",   label=f"Obs Δs' (L={L})")
+        ax.loglog(t_min[m1], d_obs[m1],   "s",  color="cornflowerblue",
+                  ms=5, mfc="none",        label=f"Obs Δs' (L={L})")
     if m2.any():
-        ax.loglog(t[m2], d_model[m2], "--", color="salmon",
-                  lw=1.5,             label="Model Δs'")
-    ax.set_xlabel("Time (s)")
+        ax.loglog(t_min[m2], d_model[m2], "--", color="salmon",
+                  lw=1.5,                  label="Model Δs'")
+    ax.set_xlabel("Time (min)")
     ax.set_ylabel("Δs  /  Δs'  (m)")
     ax.set_title("Log–Log Diagnostic (Bourdet derivative)")
     ax.legend(fontsize=8)
@@ -341,9 +360,9 @@ def plot_results(t: np.ndarray, s_obs: np.ndarray, result: dict,
 
     # ── (2) Semi-log drawdown ─────────────────────────────────────────────────
     ax = axes[0, 1]
-    ax.semilogx(t, s_obs,   "o", color="steelblue",  ms=5, label="Observed")
-    ax.semilogx(t, s_model, "-", color="firebrick",   lw=2, label="H-J model")
-    ax.set_xlabel("Time (s)")
+    ax.semilogx(t_min, s_obs,   "o", color="steelblue",  ms=5, label="Observed")
+    ax.semilogx(t_min, s_model, "-", color="firebrick",   lw=2, label="H-J model")
+    ax.set_xlabel("Time (min)")
     ax.set_ylabel("Drawdown (m)")
     ax.set_title("Semi-Log Drawdown")
     ax.legend(fontsize=8)
@@ -365,9 +384,9 @@ def plot_results(t: np.ndarray, s_obs: np.ndarray, result: dict,
     # ── (4) Residuals vs time ─────────────────────────────────────────────────
     ax = axes[1, 1]
     residuals = s_obs - s_model
-    ax.semilogx(t, residuals, "o", color="darkorange", ms=5)
+    ax.semilogx(t_min, residuals, "o", color="darkorange", ms=5)
     ax.axhline(0, color="k", lw=1, linestyle="--")
-    ax.set_xlabel("Time (s)")
+    ax.set_xlabel("Time (min)")
     ax.set_ylabel("Residual  obs − model  (m)")
     ax.set_title(f"Residuals  (RMSE = {stats['RMSE (m)']:.4f} m)")
     ax.grid(True, which="both", alpha=0.3)
@@ -382,18 +401,21 @@ def plot_results(t: np.ndarray, s_obs: np.ndarray, result: dict,
 # Synthetic data generator (for testing without a CSV)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_test_data(T: float = 1e-3, S: float = 1e-4,
-                       B: float = 500.0, Q: float = 1e-3,
+def generate_test_data(T_day: float = 86.4, S: float = 1e-4,
+                       B: float = 500.0, Q_ls: float = 1.0,
                        r: float = 50.0,
-                       t_min: float = 60, t_max: float = 86400,
+                       t_start_min: float = 1, t_end_min: float = 1440,
                        n_pts: int = 40, noise_std: float = 0.005,
                        seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
-    """Return (t, s_noisy) for a synthetic Hantush-Jacob CRT."""
-    t = np.logspace(np.log10(t_min), np.log10(t_max), n_pts)
-    s = hantush_drawdown(t, T, S, B, Q, r)
+    """Return (t_seconds, s_noisy) for a synthetic Hantush-Jacob CRT.  T_day in m²/day, Q_ls in L/s."""
+    t_s = np.logspace(np.log10(t_start_min * _MIN_TO_S),
+                      np.log10(t_end_min   * _MIN_TO_S), n_pts)
+    T_si = T_day / _DAY_TO_S
+    Q_si = Q_ls * _LS_TO_M3S
+    s = hantush_drawdown(t_s, T_si, S, B, Q_si, r)
     rng = np.random.default_rng(seed)
     s_noisy = np.maximum(s + rng.normal(0, noise_std, size=n_pts), 0.0)
-    return t, s_noisy
+    return t_s, s_noisy
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -405,13 +427,13 @@ def build_parser() -> argparse.ArgumentParser:
         description="Hantush-Jacob CRT analysis with Bourdet derivative and model-fit reporting.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--data",   help="CSV file: time(s), drawdown(m)")
+    p.add_argument("--data",   help="CSV file: time(min), drawdown(m)")
     p.add_argument("--Q",      type=float, required=True,
-                   help="Pumping rate (m³/s)")
+                   help="Pumping rate (L/s)")
     p.add_argument("--r",      type=float, required=True,
                    help="Distance from pumping well to observation well (m)")
-    p.add_argument("--T_init", type=float, default=1e-3,
-                   help="Initial T guess (m²/s)")
+    p.add_argument("--T_init", type=float, default=86.4,
+                   help="Initial T guess (m²/day)")
     p.add_argument("--S_init", type=float, default=1e-4,
                    help="Initial S guess (-)")
     p.add_argument("--B_init", type=float, default=500.0,
@@ -435,8 +457,8 @@ def main(argv=None):
             print("No --data file given; running in demo mode with synthetic data.")
         print("  Generating synthetic Hantush-Jacob CRT data …")
         t, s_obs = generate_test_data(
-            T=args.T_init, S=args.S_init, B=args.B_init,
-            Q=args.Q, r=args.r,
+            T_day=args.T_init, S=args.S_init, B=args.B_init,
+            Q_ls=args.Q, r=args.r,
         )
     else:
         path = Path(args.data)
